@@ -1,0 +1,18 @@
+[package]
+name = "unpatch"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Runs on the phone: rebuilds a library from the previous one and a zstd --patch-from delta"
+
+# Built by `cargo gpui` for aarch64-linux-android; not part of the workspace.
+[workspace]
+
+[dependencies]
+zstd = "0.13"
+
+# Decompressing ~85 MB unoptimised is slow; this is a debug build.
+[profile.dev]
+opt-level = 3
+strip = true

@@ -1,0 +1,19 @@
+[package]
+name = "cargo-gpui"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Dev loop for GPUI apps on Android: hot patching (Subsecond), reloads without reinstalling (see the GPUI Mobile Lab's hot-patching plan)"
+
+
+[dependencies]
+anyhow = "1"
+ar = "0.9"
+object = { version = "0.37", default-features = false, features = ["read", "write", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subsecond-types = "0.7.10"
+toml = "0.9"
+

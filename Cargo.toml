@@ -1,0 +1,16 @@
+[workspace]
+members = ["cargo-gpui", "gpui-hot", "gpui-hot-macros"]
+# `cargo build` here builds the CLI only; gpui-hot pulls in GPUI.
+default-members = ["cargo-gpui"]
+# Built by cargo-gpui for the phone, with its own workspace.
+exclude = ["cargo-gpui/unpatch"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Bombatomica64/cargo-gpui"
+
+# Hashing and parsing ~70 MB of objects per patch is 10x slower unoptimised.
+[profile.dev]
+opt-level = 3
