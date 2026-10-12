@@ -15,11 +15,14 @@ use anyhow::anyhow;
 use serde::Serialize;
 
 use crate::{
-    device::adb,
+    device,
     library::{self, Rustc, cgu_name, hash_file, ndk_bin, tip_objects},
     project::Project,
     read_json, stub, write_json,
 };
+
+/// How long the app gets to apply a patch.
+const APPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Cargo's jobserver file descriptors don't exist outside cargo.
 const JOBSERVER_VARS: [&str; 3] = ["CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS"];
@@ -80,6 +83,10 @@ pub struct Patcher {
     generation: u32,
     /// Build patches without pushing them (`CARGO_GPUI_OFFLINE`).
     offline: bool,
+    /// Host copy and phone path of the last patch, the base of the next
+    /// one's delta. The first patch goes whole: a delta against the staged
+    /// library saves only ~20%, and costs more than that to make and apply.
+    delta_base: Option<(PathBuf, String)>,
 }
 
 impl Patcher {
@@ -92,20 +99,6 @@ impl Patcher {
             base.symbols.len(),
             t.elapsed().as_millis()
         );
-        if !offline {
-            let project = Project::get()?;
-            let dir = project.device_patch_dir()?;
-            // Generations restart at 1: an acknowledgement from an earlier
-            // process or session must not count.
-            let package = project.package()?;
-            adb(&[
-                "shell",
-                &format!(
-                    "rm -rf {dir} && mkdir -p {dir} && chmod 755 {dir}/.. {dir} \
-                     && run-as {package} rm -f files/dev/applied"
-                ),
-            ])?;
-        }
         Ok(Self {
             rustc: read_json(&state.join("rustc.json"))?,
             fat_link: read_json(&state.join("link-fat.json"))?,
@@ -121,11 +114,13 @@ impl Patcher {
                 .as_millis() as u64,
             generation: 0,
             offline,
+            delta_base: None,
         })
     }
 
-    /// Builds and pushes a patch of the current sources. Returns its
-    /// generation, or `None` if the code didn't change.
+    /// Builds and pushes a patch of the current sources and waits for the app
+    /// to apply it. Returns its generation, or `None` if the code didn't
+    /// change.
     pub fn patch(&mut self) -> Result<Option<u32>, PatchError> {
         let project = Project::get()?;
         let state = project.state_dir();
@@ -229,26 +224,35 @@ impl Patcher {
         _ = std::fs::remove_file(&patch);
         lap("table+strip", &mut t);
 
-        // 4. Push library and table in one adb call (each costs ~0.5 s through
-        //    a tunnel); files go in argument order, so the table lands last.
+        // 4. Push library and table, the table last, and wait for the app
+        //    to apply them: one adb call with a delta (each costs ~0.5 s
+        //    through a tunnel).
         let size = std::fs::metadata(&stripped)?.len();
+        let mut sent = String::new();
         if !self.offline {
-            adb(&[
-                "push",
-                "-z",
-                "zstd",
-                stripped.to_str().unwrap(),
-                table_path.to_str().unwrap(),
-                &format!("{device_dir}/"),
-            ])?;
-            lap("push", &mut t);
+            sent = device::push_patch(
+                &stripped,
+                &table_path,
+                &device_lib,
+                self.delta_base.as_ref(),
+                generation,
+                APPLY_TIMEOUT,
+            )?;
+            sent = format!(", sent as {sent}");
+            lap("push+apply", &mut t);
         }
-        _ = std::fs::remove_dir_all(stripped.parent().unwrap());
+        let base = state.join("patch-base.so");
+        std::fs::rename(&stripped, &base)?;
+        self.delta_base = Some((base, device_lib));
+        if !self.offline {
+            // Offline, the table stays in push/ for inspection.
+            _ = std::fs::remove_dir_all(stripped.parent().unwrap());
+        }
 
         let total: Duration = times.iter().map(|(_, d)| *d).sum();
         let detail: Vec<String> = times.iter().map(|(n, d)| format!("{n} {} ms", d.as_millis())).collect();
         println!(
-            "cargo gpui: patch {generation}: {changed}/{} objects changed, {hot_closures} hot closures, {:.1} MB, {} ms ({})",
+            "cargo gpui: patch {generation}: {changed}/{} objects changed, {hot_closures} hot closures, {:.1} MB{sent}, {} ms ({})",
             objects.len(),
             size as f64 / 1e6,
             total.as_millis(),

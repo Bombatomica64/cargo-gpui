@@ -3,7 +3,9 @@
 use std::{
     env,
     path::{Path, PathBuf},
-    process::Command,
+    io::Write,
+    process::{Command, Stdio},
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
@@ -17,12 +19,7 @@ use crate::{
 /// Runs adb. `CARGO_GPUI_ADB` replaces the command, e.g. `phone adb` for a
 /// shared phone behind a lock.
 pub fn adb(args: &[&str]) -> anyhow::Result<String> {
-    let custom = env::var("CARGO_GPUI_ADB").ok();
-    let mut words = custom.as_deref().unwrap_or("adb").split_whitespace();
-    let out = Command::new(words.next().context("empty CARGO_GPUI_ADB")?)
-        .args(words)
-        .args(args)
-        .output()?;
+    let out = adb_output(args, None)?;
     ensure!(
         out.status.success(),
         "adb {args:?}: {}{}",
@@ -32,65 +29,93 @@ pub fn adb(args: &[&str]) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Quotes `s` for the device shell.
-fn quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
+/// Runs `adb shell -T <script>` with `input` on stdin; returns its exit
+/// code (adb's shell protocol passes it on) and output.
+fn shell_with_input(script: &str, input: Option<&[u8]>) -> anyhow::Result<(i32, String)> {
+    let out = adb_output(&["shell", "-T", script], input)?;
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    Ok((out.status.code().unwrap_or(-1), text))
 }
 
-/// A file from the app's `files/dev` (written by the `gpui-hot` crate), or
-/// `None` if it doesn't exist.
-pub fn app_file(name: &str) -> anyhow::Result<Option<String>> {
-    let package = Project::get()?.package()?;
-    let out = adb(&[
-        "shell",
-        &format!("run-as {package} cat files/dev/{name} 2>/dev/null || true"),
-    ])?;
-    Ok(Some(out).filter(|s| !s.is_empty()))
+fn adb_output(args: &[&str], input: Option<&[u8]>) -> anyhow::Result<std::process::Output> {
+    let custom = env::var("CARGO_GPUI_ADB").ok();
+    let mut words = custom.as_deref().unwrap_or("adb").split_whitespace();
+    let mut child = Command::new(words.next().context("empty CARGO_GPUI_ADB")?)
+        .args(words)
+        .args(args)
+        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    std::thread::scope(|scope| {
+        if let Some(input) = input {
+            let mut stdin = child.stdin.take().unwrap();
+            // A write error means adb exited early; its status says why.
+            scope.spawn(move || _ = stdin.write_all(input));
+        }
+        Ok(child.wait_with_output()?)
+    })
 }
 
-/// The running app's `aslr_reference`, waiting up to `timeout` for it to start.
+/// Exit code of a device script whose delta could not be applied (no base,
+/// or not the base it was made from): the caller sends the whole file.
+const DELTA_FAILED: i32 = 42;
+
+/// Waits on the phone, in one adb call, for the app to write `files/dev/aslr`
+/// for its current process; up to `timeout`, polling every 100 ms.
 pub fn wait_for_aslr(timeout: Duration) -> anyhow::Result<u64> {
     let package = Project::get()?.package()?;
-    let start = Instant::now();
-    loop {
-        let pid = adb(&["shell", &format!("pidof {package} || true")])?;
-        let pid = pid.split_whitespace().next();
-        if let (Some(pid), Some(file)) = (pid, app_file("aslr")?) {
-            // `<hex> <pid>`; a file left by an earlier process doesn't count.
-            let mut words = file.split_whitespace();
-            if let (Some(hex), Some(file_pid)) = (words.next(), words.next()) {
-                if file_pid == pid {
-                    return Ok(u64::from_str_radix(hex.trim_start_matches("0x"), 16)?);
-                }
-            }
-        }
-        if start.elapsed() > timeout {
-            bail!("{package} did not report its aslr_reference (is it running a debug build with gpui_hot::init?)");
-        }
-        std::thread::sleep(Duration::from_millis(250));
+    // `<hex> <pid>`; a file left by an earlier process doesn't count.
+    let script = poll_script(
+        timeout,
+        0.1,
+        &format!(
+            "p=$(pidof {package}) && a=$(run-as {package} cat files/dev/aslr 2>/dev/null) \
+             && [ \"${{a#* }}\" = \"${{p%% *}}\" ] && echo \"$a\""
+        ),
+    );
+    let (code, out) = shell_with_input(&script, None)?;
+    if code != 0 {
+        bail!("{package} did not report its aslr_reference (is it running a debug build with gpui_hot::init?)");
     }
+    let hex = out.split_whitespace().next().unwrap_or_default();
+    Ok(u64::from_str_radix(hex.trim_start_matches("0x"), 16)?)
 }
 
-/// Waits for the app to acknowledge patch `generation`: `Ok(())` once
-/// applied, `Err` if it failed there or didn't answer.
-pub fn wait_applied(generation: u32, timeout: Duration) -> anyhow::Result<()> {
-    let start = Instant::now();
-    loop {
-        if let Some(line) = app_file("applied")? {
-            if let Some(rest) = line.trim().strip_prefix(&format!("{generation} ")) {
-                return match rest {
-                    "ok" => Ok(()),
-                    error => bail!("the app could not apply patch {generation}: {error}"),
-                };
-            }
-        }
-        if start.elapsed() > timeout {
-            bail!(
-                "the app did not acknowledge patch {generation} within {timeout:?}{}",
-                recent_log().map(|l| format!("; its log:\n{l}")).unwrap_or_default()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(100));
+/// A device shell loop that runs `check` every `every` seconds until it
+/// succeeds (exit 0) or `timeout` runs out (exit 1).
+fn poll_script(timeout: Duration, every: f64, check: &str) -> String {
+    let tries = (timeout.as_secs_f64() / every).ceil().max(1.0) as u32;
+    format!("i=0; until {check}; do i=$((i+1)); [ $i -ge {tries} ] && exit 1; sleep {every}; done")
+}
+
+/// Waits on the phone for the app to acknowledge patch `generation`, so the
+/// answer costs no extra adb round trips when appended to the push.
+fn wait_applied_script(generation: u32, timeout: Duration) -> anyhow::Result<String> {
+    let package = Project::get()?.package()?;
+    Ok(poll_script(
+        timeout,
+        0.05,
+        &format!(
+            "a=$(run-as {package} cat files/dev/applied 2>/dev/null) \
+             && case $a in \"{generation} \"*) echo \"applied: $a\";; *) false;; esac"
+        ),
+    ))
+}
+
+/// `Ok(())` if the app applied patch `generation`, from the output of
+/// [`wait_applied_script`].
+fn check_applied(generation: u32, timeout: Duration, code: i32, out: &str) -> anyhow::Result<()> {
+    let line = out.lines().find_map(|l| l.strip_prefix("applied: "));
+    match line.map(|l| l.trim().strip_prefix(&format!("{generation} ")).unwrap_or(l)) {
+        Some("ok") if code == 0 => Ok(()),
+        Some(error) => bail!("the app could not apply patch {generation}: {error}"),
+        None if code == 1 => bail!(
+            "the app did not acknowledge patch {generation} within {timeout:?}{}",
+            recent_log().map(|l| format!("; its log:\n{l}")).unwrap_or_default()
+        ),
+        None => bail!("pushing patch {generation} failed ({code}): {out}"),
     }
 }
 
@@ -107,12 +132,71 @@ fn recent_log() -> Option<String> {
     (!tail.is_empty()).then(|| tail.join("\n"))
 }
 
-/// A2: run a new build without reinstalling. Pushes the stripped library to
-/// the app's files/dev/ (the debug activity loads it from there) and restarts
-/// the app with the intent extras it remembered (`gpui_hot::remember`).
+/// Puts patch library `lib` at `device_lib` and its table at `patch.json`
+/// (last: the app picks the patch up when the table appears), then waits for
+/// the app to apply it. Sends a delta against `base` (the host's copy and the
+/// phone's path of an earlier patch or library) when it can, applied by
+/// `unpatch` in the same adb call. Returns what was sent.
+pub fn push_patch(
+    lib: &Path,
+    table: &Path,
+    device_lib: &str,
+    base: Option<&(PathBuf, String)>,
+    generation: u32,
+    timeout: Duration,
+) -> anyhow::Result<String> {
+    let dir = Project::get()?.device_patch_dir()?;
+    let wait = wait_applied_script(generation, timeout)?;
+    let mut fallback = "full patch".to_string();
+    if let Some((host_base, device_base)) = base {
+        // -9: 0.1 MB in 0.2 s, against 0.3 MB in 0.1 s at -3.
+        match delta(host_base, lib, 9).and_then(|delta| {
+            let mut input = (delta.len() as u64).to_le_bytes().to_vec();
+            input.extend_from_slice(&delta);
+            input.extend(std::fs::read(table)?);
+            let unpatch = unpatch_on_device()?;
+            let script = format!(
+                "{unpatch} {device_base} - {device_lib} {dir}/patch.json || exit {DELTA_FAILED}; {wait}"
+            );
+            Ok((delta.len(), shell_with_input(&script, Some(&input))?))
+        }) {
+            Ok((_, (DELTA_FAILED, out))) => fallback = format!("full patch: delta failed: {}", out.trim()),
+            Ok((bytes, (code, out))) => {
+                check_applied(generation, timeout, code, &out)?;
+                return Ok(format!("{:.2} MB delta", bytes as f64 / 1e6));
+            }
+            Err(err) => fallback = format!("full patch: {err:#}"),
+        }
+    }
+    // One push for both files: they go in argument order, the table last.
+    adb(&["push", "-z", "zstd", lib.to_str().unwrap(), table.to_str().unwrap(), &format!("{dir}/")])?;
+    let (code, out) = shell_with_input(&wait, None)?;
+    check_applied(generation, timeout, code, &out)?;
+    Ok(fallback)
+}
+
+/// Clears the patches of earlier processes and their acknowledgement:
+/// generations restart at 1 with each patcher.
+pub fn reset_patches() -> anyhow::Result<()> {
+    adb(&["shell", &reset_patches_script()?])?;
+    Ok(())
+}
+
+fn reset_patches_script() -> anyhow::Result<String> {
+    let project = Project::get()?;
+    let (dir, package) = (project.device_patch_dir()?, project.package()?);
+    Ok(format!(
+        "rm -rf {dir} && mkdir -p {dir} && chmod 755 {dir}/.. {dir} && run-as {package} rm -f files/dev/applied"
+    ))
+}
+
+/// A2: run a new build without reinstalling. Puts the stripped library in
+/// the app's files/dev/ (the debug activity loads it from there) and
+/// restarts the app with the intent extras it remembered
+/// (`gpui_hot::remember`), clearing the patches of the old process. With a
+/// delta, all of that is one adb call.
 pub fn reload(build_args: &[String]) -> anyhow::Result<()> {
     let project = Project::get()?;
-    let package = project.package()?;
     let mut times = vec![];
     let mut t = Instant::now();
     let mut lap = |name: &'static str, t: &mut Instant| {
@@ -122,22 +206,49 @@ pub fn reload(build_args: &[String]) -> anyhow::Result<()> {
     let lib = library::build(build_args)?;
     lap("build", &mut t);
 
-    let sent = push_library(&lib)?;
-    lap("push", &mut t);
-
-    let extras = app_file("extras")?.unwrap_or_default();
-    adb(&["shell", &format!("am force-stop {package}; run-as {package} rm -f files/dev/aslr")])?;
-    let mut start = format!("am start -W -n {package}/{}", project.activity);
-    for (key, value) in extras.lines().filter_map(|l| l.split_once('=')) {
-        start.push_str(&format!(" --es {} {}", quote(key), quote(value)));
-    }
-    let out = adb(&["shell", &start])?;
-    ensure!(out.contains("Status: ok"), "am start failed: {out}");
-    lap("restart", &mut t);
+    let dir = project.device_stage_dir()?;
+    // The staged copy stays on the phone as the base of the next delta;
+    // `pushed` is the host's copy of it.
+    let staged = format!("{dir}/lib.so");
+    let pushed = project.state_dir().join("device-lib.so");
+    let restart = restart_script(&staged)?;
+    let delta = (|| {
+        ensure!(pushed.exists(), "no library staged on the phone yet");
+        let delta = delta(&pushed, &lib, 3)?;
+        let mut input = (delta.len() as u64).to_le_bytes().to_vec();
+        input.extend_from_slice(&delta);
+        let unpatch = unpatch_on_device()?;
+        let script = format!(
+            "{{ {unpatch} {staged} - {staged}.new && mv {staged}.new {staged}; }} || exit {DELTA_FAILED}; {restart}"
+        );
+        Ok((delta.len(), shell_with_input(&script, Some(&input))?))
+    })();
+    let (sent, (code, out)) = match delta {
+        Ok((bytes, (code, out))) if code != DELTA_FAILED => {
+            lap("delta+restart", &mut t);
+            (format!("{:.1} MB delta", bytes as f64 / 1e6), (code, out))
+        }
+        delta => {
+            let why = match delta {
+                Ok((_, (_, out))) => out.trim().to_string(),
+                Err(err) => format!("{err:#}"),
+            };
+            println!("cargo gpui: full push ({why})");
+            _ = std::fs::remove_file(&pushed);
+            adb(&["shell", &format!("rm -rf {dir} && mkdir -p {dir} && chmod 755 {DEVICE_TOOLS} {dir}")])?;
+            push_chunked(&lib, &staged)?;
+            lap("push", &mut t);
+            let result = shell_with_input(&restart, None)?;
+            lap("restart", &mut t);
+            ("full library".to_string(), result)
+        }
+    };
+    std::fs::copy(&lib, &pushed)?;
+    ensure!(code == 0 && out.contains("Status: ok"), "restarting the app failed ({code}): {out}");
 
     let total: Duration = times.iter().map(|(_, d)| *d).sum();
     let detail: Vec<String> = times.iter().map(|(n, d)| format!("{n} {} ms", d.as_millis())).collect();
-    let extras: Vec<&str> = extras.lines().collect();
+    let extras: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix("extra: ")).collect();
     println!(
         "cargo gpui: reloaded {:.0} MB ({sent}){} in {} ms ({})",
         std::fs::metadata(&lib)?.len() as f64 / 1e6,
@@ -148,72 +259,51 @@ pub fn reload(build_args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Puts `lib` where the debug activity loads it, sending a delta when the
-/// phone has the previous one. Returns what was sent.
-fn push_library(lib: &Path) -> anyhow::Result<String> {
+/// Device shell: copy the staged library where the debug activity loads it
+/// (read-only: loaded code must be, for apps targeting Android 14), stop the
+/// app, clear its patches, and start it again with the extras it remembered
+/// (`key=value` lines, passed as `--es key value`).
+fn restart_script(staged: &str) -> anyhow::Result<String> {
     let project = Project::get()?;
     let package = project.package()?;
-    let dir = project.device_stage_dir()?;
-    // The staged copy stays on the phone as the base of the next delta;
-    // `pushed` is the host's copy of it.
-    let staged = format!("{dir}/lib.so");
-    let pushed = project.state_dir().join("device-lib.so");
-    let sent = match push_delta(lib, &pushed, &staged) {
-        Ok(bytes) => format!("{:.1} MB delta", bytes as f64 / 1e6),
-        Err(err) => {
-            println!("cargo gpui: full push ({err:#})");
-            _ = std::fs::remove_file(&pushed);
-            adb(&["shell", &format!("rm -rf {dir} && mkdir -p {dir} && chmod 755 {DEVICE_TOOLS} {dir}")])?;
-            push_chunked(lib, &staged)?;
-            "full library".to_string()
-        }
-    };
-    std::fs::copy(lib, &pushed)?;
-    // Loaded code must be read-only for apps targeting Android 14.
     let name = format!("lib{}.so", project.tip);
-    adb(&[
-        "shell",
-        &format!(
-            "run-as {package} sh -c 'mkdir -p files/dev && rm -f files/dev/{name} \
-             && cp {staged} files/dev/{name} && chmod 444 files/dev/{name}'"
-        ),
-    ])?;
-    Ok(sent)
+    Ok(format!(
+        "run-as {package} sh -c 'mkdir -p files/dev && rm -f files/dev/{name} \
+         && cp {staged} files/dev/{name} && chmod 444 files/dev/{name}' \
+         && am force-stop {package} && run-as {package} rm -f files/dev/aslr && {reset} \
+         && run-as {package} cat files/dev/extras 2>/dev/null | {{ set --; \
+         while IFS= read -r l; do case $l in *=*) echo \"extra: $l\"; set -- \"$@\" --es \"${{l%%=*}}\" \"${{l#*=}}\";; esac; done; \
+         am start -W -n {package}/{activity} \"$@\"; }}",
+        reset = reset_patches_script()?,
+        activity = project.activity,
+    ))
 }
 
-/// Sends only a zstd `--patch-from` delta against the library staged by the
-/// last reload (~1.4 MB instead of ~21 MB compressed), which `unpatch`
-/// applies on the phone. Errs, leaving the staged copy alone, when there is
-/// no base or it isn't the one the delta was made from (zstd's checksum).
-fn push_delta(lib: &Path, pushed: &Path, staged: &str) -> anyhow::Result<u64> {
-    ensure!(pushed.exists(), "no library staged on the phone yet");
-    let delta = Project::get()?.state_dir().join("lib.delta.zst");
-    let status = Command::new("zstd")
-        .args(["-q", "-f", "-3", "--patch-from"])
-        .arg(pushed)
-        .arg(lib)
-        .arg("-o")
-        .arg(&delta)
-        .status()?;
-    ensure!(status.success(), "zstd --patch-from failed");
-    let bytes = std::fs::metadata(&delta)?.len();
-    let unpatch = unpatch_binary()?;
-    let result = (|| {
-        let d = DEVICE_TOOLS;
-        // --sync skips unpatch when the phone's copy is current.
-        adb(&["push", "--sync", unpatch.to_str().unwrap(), &format!("{d}/unpatch")])?;
-        adb(&["push", delta.to_str().unwrap(), &format!("{staged}.delta")])?;
-        adb(&[
-            "shell",
-            &format!(
-                "test -f {staged} && chmod 755 {d}/unpatch && {d}/unpatch {staged} {staged}.delta {staged}.new \
-                 && mv {staged}.new {staged}; status=$?; rm -f {staged}.delta; exit $status"
-            ),
-        ])
-    })();
-    _ = std::fs::remove_file(&delta);
-    result?;
-    Ok(bytes)
+/// A zstd `--patch-from` delta of `new` against `base`: a reload's library
+/// against the last one (~1.4 MB instead of ~21 MB compressed), or a patch
+/// against the last patch. zstd's frame checksum makes `unpatch` fail on the
+/// wrong base.
+fn delta(base: &Path, new: &Path, level: u8) -> anyhow::Result<Vec<u8>> {
+    let out = Command::new("zstd")
+        .args(["-q", "-c", &format!("-{level}"), "--patch-from"])
+        .arg(base)
+        .arg(new)
+        .output()?;
+    ensure!(out.status.success(), "zstd --patch-from failed: {}", String::from_utf8_lossy(&out.stderr));
+    Ok(out.stdout)
+}
+
+/// `unpatch`'s path on the phone, pushed once per run (`--sync` skips the
+/// copy when the phone's is current).
+fn unpatch_on_device() -> anyhow::Result<String> {
+    static PUSHED: OnceLock<()> = OnceLock::new();
+    let device = format!("{DEVICE_TOOLS}/unpatch");
+    if PUSHED.get().is_none() {
+        adb(&["push", "--sync", unpatch_binary()?.to_str().unwrap(), &device])?;
+        adb(&["shell", &format!("chmod 755 {DEVICE_TOOLS} {device}")])?;
+        _ = PUSHED.set(());
+    }
+    Ok(device)
 }
 
 /// The phone has no zstd binary: builds `unpatch` (../unpatch) for it.
