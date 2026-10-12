@@ -16,8 +16,7 @@ use crate::{
     project::Project,
 };
 
-/// How long the app gets to apply a patch, and to start after a reload.
-const APPLY_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the app gets to start after a reload.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 
 enum Event {
@@ -102,16 +101,13 @@ pub fn dev(build_args: &[String]) -> anyhow::Result<ExitCode> {
             };
             let failed = match patcher.patch() {
                 Ok(None) => continue,
-                Ok(Some(generation)) => match device::wait_applied(generation, APPLY_TIMEOUT) {
-                    Ok(()) => {
-                        println!(
-                            "cargo gpui: patch {generation} applied {} ms after the save",
-                            saved.elapsed().as_millis()
-                        );
-                        continue;
-                    }
-                    Err(err) => err,
-                },
+                Ok(Some(generation)) => {
+                    println!(
+                        "cargo gpui: patch {generation} applied {} ms after the save",
+                        saved.elapsed().as_millis()
+                    );
+                    continue;
+                }
                 Err(PatchError::Compile(stderr)) => {
                     eprint!("{stderr}");
                     continue;
@@ -134,6 +130,9 @@ pub fn watch() -> anyhow::Result<ExitCode> {
         Some(hex) => u64::from_str_radix(hex.trim_start_matches("0x"), 16)?,
         None => device::wait_for_aslr(Duration::ZERO)?,
     };
+    if offline.is_none() {
+        device::reset_patches()?;
+    }
     let mut patcher = Patcher::new(aslr, offline.is_some())?;
     let mut watcher = Watcher::new()?;
     println!("cargo gpui: watching {}", watcher.src.display());
@@ -142,15 +141,10 @@ pub fn watch() -> anyhow::Result<ExitCode> {
             continue;
         };
         match patcher.patch() {
-            Ok(Some(generation)) if offline.is_none() => {
-                match device::wait_applied(generation, APPLY_TIMEOUT) {
-                    Ok(()) => println!(
-                        "cargo gpui: patch {generation} applied {} ms after the save",
-                        saved.elapsed().as_millis()
-                    ),
-                    Err(err) => eprintln!("cargo gpui: {err:#}"),
-                }
-            }
+            Ok(Some(generation)) if offline.is_none() => println!(
+                "cargo gpui: patch {generation} applied {} ms after the save",
+                saved.elapsed().as_millis()
+            ),
             Ok(_) => {}
             Err(PatchError::Compile(stderr)) => eprint!("{stderr}"),
             Err(PatchError::Other(err)) => eprintln!("cargo gpui: patch failed: {err:#}"),

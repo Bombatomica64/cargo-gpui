@@ -14,11 +14,15 @@ has the measurements and design notes.
 
 - **Hot patching (A1)** with [Subsecond](https://docs.rs/subsecond): on save,
   recompile the app crate, link a patch library against the running app and
-  push it; the app loads it between frames and keeps its state.
+  push it; the app loads it between frames and keeps its state. From the
+  second patch on, it sends a zstd `--patch-from` delta against the last
+  patch (~0.1 MB instead of ~2.3 MB compressed), which `unpatch/`, a small
+  arm64 binary the tool builds and pushes, applies on the phone; the same adb
+  call waits for the app to apply it.
 - **Reload (A2)**: push a new build of the library and restart the app where
   it was, with no Gradle and no reinstall. After the first push it sends a
-  zstd `--patch-from` delta (~1.4 MB instead of ~21 MB), which `unpatch/`, a
-  small arm64 binary the tool builds and pushes, applies on the phone.
+  delta against the last library (~1.5 MB instead of ~21 MB), and applies
+  it, copies the library into the app and restarts it in one adb call.
 
 ```sh
 cargo install --git https://github.com/Bombatomica64/cargo-gpui cargo-gpui
